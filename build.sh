@@ -288,7 +288,7 @@ if [ "$variant" = single ]; then
     fi
     # It exports libmpv's API, and nothing of the libraries linked into it.
     exports=$($TARGET-objdump -p "$dist/libmpv-2.dll" | sed -n '/^\[Ordinal\/Name Pointer\] Table/,/^$/p' |
-        grep '^\s*\[' | awk '{print $NF}')
+        grep '^\s*\[ *[0-9]' | awk '{print $NF}')
     if ! grep -qx mpv_create <<<"$exports"; then
         echo "error: libmpv-2.dll doesn't export mpv_create" >&2
         exit 1
