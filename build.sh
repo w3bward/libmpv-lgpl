@@ -3,7 +3,12 @@
 # Linux. Adapted from mpv's own ci/build-mingw64.sh (v0.41.0), with every source pinned, the GPL parts off, and only
 # what libmpv's OpenGL render API needs: no Vulkan, shaderc, SPIRV-Cross, Lua or JavaScript.
 #
-# Output: dist/ (the DLLs, headers, licences and BUILDINFO.txt) and sources/ (every source tree it was built from).
+# Usage: build.sh [separate|single]
+#   separate (the default): libmpv and each dependency as its own DLL, so any of them can be replaced.
+#   single: libmpv and every dependency, the MinGW runtime included, statically linked into one libmpv-2.dll.
+#
+# Output: dist/ (dist-single/ for single: the DLLs, headers, licences and BUILDINFO.txt) and sources/ (every source
+# tree it was built from).
 set -Eeuo pipefail
 # set -e stops without saying why; this says which command failed, and where.
 trap 'echo "error: build.sh line $LINENO: $BASH_COMMAND" >&2' ERR
@@ -11,10 +16,20 @@ trap 'echo "error: build.sh line $LINENO: $BASH_COMMAND" >&2' ERR
 root=$PWD
 . "$root/versions.env"
 
+variant=${1:-separate}
+case $variant in
+separate) suffix="" ;;
+single) suffix="-single" ;;
+*)
+    echo "usage: build.sh [separate|single]" >&2
+    exit 2
+    ;;
+esac
+
 export TARGET=${TARGET:-x86_64-w64-mingw32}
 src=$root/work/src
-prefix=$root/work/prefix
-dist=$root/dist
+prefix=$root/work/prefix$suffix
+dist=$root/dist$suffix
 mkdir -p "$src" "$prefix" "$dist"
 ln -snf . "$prefix/usr"
 ln -snf . "$prefix/local"
@@ -32,13 +47,27 @@ export LDFLAGS="-fstack-protector-strong"
 export PKG_CONFIG_SYSROOT_DIR=$prefix
 export PKG_CONFIG_LIBDIR=$prefix/lib/pkgconfig
 
-shared="--disable-static --enable-shared"
+if [ "$variant" = single ]; then
+    libs="--enable-static --disable-shared"
+    default_library=static
+    prefer_static=true
+    zlib_shared=0
+    # The MinGW runtime (libgcc, libstdc++, winpthreads) too, as the GCC Runtime Library Exception allows, so
+    # libmpv-2.dll imports only Windows' own DLLs.
+    LDFLAGS="$LDFLAGS -static"
+else
+    libs="--disable-static --enable-shared"
+    default_library=shared
+    prefer_static=false
+    zlib_shared=1
+fi
 
 cat >"$prefix/crossfile" <<EOF
 [built-in options]
 buildtype = 'release'
 wrap_mode = 'nodownload'
-default_library = 'shared'
+default_library = '${default_library}'
+prefer_static = ${prefer_static}
 [binaries]
 c = '${CC}'
 cpp = '${CXX}'
@@ -116,14 +145,14 @@ endgroup
 
 group "libiconv"
 builddir "$src/libiconv-1.18"
-../configure --host="$TARGET" --prefix=/ $shared
+../configure --host="$TARGET" --prefix=/ $libs
 install_build
 endgroup
 
 group "zlib"
 cd "$src/zlib-1.3.2"
 make -fwin32/Makefile.gcc clean
-make -fwin32/Makefile.gcc PREFIX="$TARGET-" CC="$CC" SHARED_MODE=1 \
+make -fwin32/Makefile.gcc PREFIX="$TARGET-" CC="$CC" SHARED_MODE=$zlib_shared \
     DESTDIR="$prefix" BINARY_PATH=/bin INCLUDE_PATH=/include LIBRARY_PATH=/lib install
 endgroup
 
@@ -143,12 +172,16 @@ endgroup
 # in media-manager).
 ffmpeg_args=(
     --prefix=/ --target-os=mingw32 --arch=x86_64 --enable-cross-compile --cross-prefix="$TARGET-"
-    --pkg-config=pkg-config --cc="$CC" --cxx="$CXX" $shared
+    --pkg-config=pkg-config --cc="$CC" --cxx="$CXX" $libs
     # iconv and zlib are found by the compiler, not pkg-config.
     --extra-cflags="-I$prefix/include" --extra-ldflags="-L$prefix/lib"
     --disable-doc --disable-programs --disable-network
     --enable-libdav1d --enable-zlib --enable-iconv
 )
+if [ "$variant" = single ]; then
+    # So FFmpeg's checks link dav1d with everything dav1d's static library needs.
+    ffmpeg_args+=(--pkg-config-flags=--static)
+fi
 group "FFmpeg"
 builddir "$src/ffmpeg"
 ../configure "${ffmpeg_args[@]}"
@@ -156,11 +189,24 @@ install_build
 endgroup
 
 group "libplacebo"
+# libplacebo always compiles with PL_EXPORT, which marks its API dllexport even in a static library, so libmpv-2.dll
+# would export it too. Built static, it gets PL_STATIC instead (what its headers expect of a static build); built
+# shared, nothing changes. Patched in the source tree, so the sources archive has it.
+sed -i "s/c_args: \['-DPL_EXPORT'\],/c_args: get_option('default_library') == 'static' ? ['-DPL_STATIC'] : ['-DPL_EXPORT'],/" \
+    "$src/libplacebo/src/meson.build"
+grep -qF "['-DPL_STATIC'] : ['-DPL_EXPORT']" "$src/libplacebo/src/meson.build"
 builddir "$src/libplacebo"
 meson setup .. --cross-file "$prefix/crossfile" --prefix=/ \
     -Ddemos=false -Dtests=false -Dopengl=enabled -Dlcms=enabled \
     -Dd3d11=disabled -Dvulkan=disabled -Dshaderc=disabled -Dglslang=disabled
 install_build
+if [ "$variant" = single ]; then
+    # libplacebo has C++ code, but its pkg-config file doesn't name the C++ runtime, which a static link into libmpv
+    # (linked as C) needs.
+    pc=$prefix/lib/pkgconfig/libplacebo.pc
+    grep -q '^Libs.private:' "$pc" || echo 'Libs.private:' >>"$pc"
+    sed -i 's/^Libs.private:.*/& -lstdc++/' "$pc"
+fi
 endgroup
 
 group "FreeType"
@@ -200,8 +246,9 @@ mpv_args=(
 group "mpv"
 cd "$src/mpv"
 rm -rf builddir
+# libmpv is the one shared library either way.
 CFLAGS="$CFLAGS -I$prefix/include" LDFLAGS="$LDFLAGS -L$prefix/lib" \
-    meson setup builddir --cross-file "$prefix/crossfile" --prefix=/ "${mpv_args[@]}"
+    meson setup builddir --cross-file "$prefix/crossfile" --prefix=/ -Ddefault_library=shared "${mpv_args[@]}"
 meson compile -C builddir
 DESTDIR="$prefix" meson install -C builddir
 endgroup
@@ -231,6 +278,28 @@ done
 
 # Without debug symbols, which nothing at runtime needs (the MinGW runtime's libstdc++ alone carries about 24 MB).
 $TARGET-strip --strip-unneeded "$dist"/*.dll
+
+if [ "$variant" = single ]; then
+    # The walk found no DLL of this build or of the toolchain: libmpv-2.dll imports only Windows' own.
+    others=$(cd "$dist" && ls *.dll | grep -vx libmpv-2.dll || true)
+    if [ -n "$others" ]; then
+        echo "error: libmpv-2.dll should be the only DLL, but it loads: $others" >&2
+        exit 1
+    fi
+    # It exports libmpv's API, and nothing of the libraries linked into it.
+    exports=$($TARGET-objdump -p "$dist/libmpv-2.dll" | sed -n '/^\[Ordinal\/Name Pointer\] Table/,/^$/p' |
+        grep '^\s*\[' | awk '{print $NF}')
+    if ! grep -qx mpv_create <<<"$exports"; then
+        echo "error: libmpv-2.dll doesn't export mpv_create" >&2
+        exit 1
+    fi
+    foreign=$(grep -v '^mpv_' <<<"$exports" || true)
+    if [ -n "$foreign" ]; then
+        echo "error: libmpv-2.dll exports more than libmpv's API:" >&2
+        echo "$foreign" >&2
+        exit 1
+    fi
+fi
 
 # Each project's licence notices, as the LGPL and the others require: whichever of the files named it has, and at
 # least one.
@@ -265,6 +334,11 @@ copy_licenses gcc-runtime "/usr/share/doc/gcc-mingw-w64-base" copyright
 
 {
     echo "libmpv, LGPL build, for 64-bit Windows (MinGW-w64)"
+    if [ "$variant" = single ]; then
+        echo "Single DLL: libmpv, every library below and the MinGW-w64 runtime statically linked into libmpv-2.dll"
+    else
+        echo "Separate DLLs: libmpv, each library below and the MinGW-w64 runtime as its own DLL"
+    fi
     echo
     echo "Sources (pinned in versions.env):"
     grep -E '_(TAG|COMMIT|URL|SHA256)=' "$root/versions.env"
@@ -273,6 +347,7 @@ copy_licenses gcc-runtime "/usr/share/doc/gcc-mingw-w64-base" copyright
     echo "FFmpeg configure options: ${ffmpeg_args[*]}"
     echo
     echo "Toolchain: $($CC --version | head -1)"
+    echo "Link options: $LDFLAGS"
     echo "Built from build repo commit: $(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)"
 } >"$dist/BUILDINFO.txt"
 cp "$root/versions.env" "$dist/"
@@ -284,4 +359,4 @@ mkdir -p "$root/sources"
 tar --exclude=builddir --exclude=.git --exclude='*.tar.gz' --exclude='*.tar.xz' -C "$root/work" -cJf "$root/sources/sources.tar.xz" src
 endgroup
 
-echo "Built: $(ls "$dist"/*.dll | wc -l) DLLs in dist/"
+echo "Built: $(ls "$dist"/*.dll | wc -l) DLLs in dist$suffix/"

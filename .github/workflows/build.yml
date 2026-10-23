@@ -1,7 +1,7 @@
 name: build
 
-# Builds and checks libmpv on every change. A tag named mpv-<version>-r<n> (for example mpv-0.41.0-r1) also publishes
-# the build as a release, with its sources.
+# Builds and checks libmpv on every change, as separate DLLs and as a single DLL. A tag named mpv-<version>-r<n> (for
+# example mpv-0.41.0-r1) also publishes both as a release, with their sources.
 on:
   push:
     branches: [main]
@@ -16,9 +16,15 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [separate, single]
     env:
       TARGET: x86_64-w64-mingw32
       WINEDEBUG: -all
+      # Where build.sh puts each variant, and the suffix of its zip's name.
+      SUFFIX: ${{ matrix.variant == 'single' && '-single' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -32,29 +38,33 @@ jobs:
           pipx install meson==1.7.0
 
       - name: Build
-        run: ./build.sh
+        run: ./build.sh ${{ matrix.variant }}
 
       - name: Check it's an LGPL build
-        run: python3 verify.py dist
+        run: python3 verify.py dist$SUFFIX
 
+      # The test program links its own runtime statically, so it runs on nothing but what's in dist.
       - name: Smoke test under Wine
         run: |
-          $TARGET-gcc-posix -O2 -Idist/include smoke/smoke.c -o dist/smoke.exe -Lwork/prefix/lib -lmpv
-          cp smoke/clip.mp4 dist/
+          dist=dist$SUFFIX
+          $TARGET-gcc-posix -O2 -I$dist/include smoke/smoke.c -o $dist/smoke.exe -static work/prefix$SUFFIX/lib/libmpv.dll.a
+          cp smoke/clip.mp4 $dist/
           wine=$(command -v wine64 || echo /usr/lib/wine/wine64)
-          (cd dist && "$wine" smoke.exe)
-          rm dist/smoke.exe dist/clip.mp4
+          (cd $dist && "$wine" smoke.exe)
+          rm $dist/smoke.exe $dist/clip.mp4
 
+      # Both variants are built from the same sources, so only one publishes them.
       - name: Package
         id: package
         run: |
           name="libmpv-lgpl-${GITHUB_REF_NAME//\//-}-x86_64"
           mkdir -p out
-          (cd dist && zip -qr9 "../out/$name.zip" .)
-          cp sources/sources.tar.xz "out/$name-sources.tar.xz"
-          (cd out && sha256sum * > SHA256SUMS)
-          cat out/SHA256SUMS
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+          (cd dist$SUFFIX && zip -qr9 "../out/$name$SUFFIX.zip" .)
+          if [ "${{ matrix.variant }}" = separate ]; then
+            cp sources/sources.tar.xz "out/$name-sources.tar.xz"
+          fi
+          (cd out && sha256sum *)
+          echo "name=$name$SUFFIX" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -62,16 +72,32 @@ jobs:
           path: out/
           retention-days: 14
 
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/mpv-')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out/
+          merge-multiple: true
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/mpv-')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          name="libmpv-lgpl-${GITHUB_REF_NAME}-x86_64"
+          (cd out && sha256sum * > SHA256SUMS)
+          cat out/SHA256SUMS
           {
             echo "LGPL libmpv for 64-bit Windows, built from pinned sources. Checked before publishing: mpv built with -Dgpl=false, FFmpeg LGPL, no x264 or x265, and a smoke test that seeks exactly and steps a frame."
             echo
+            echo "- \`$name.zip\`: libmpv and each dependency as its own DLL, so any of them can be replaced."
+            echo "- \`$name-single.zip\`: libmpv and every dependency statically linked into one \`libmpv-2.dll\`, which loads nothing but Windows' own DLLs."
+            echo "- \`$name-sources.tar.xz\`: the sources both were built from."
+            echo
             echo '```'
-            cat dist/BUILDINFO.txt
+            unzip -p "out/$name.zip" BUILDINFO.txt
             echo '```'
             echo
             echo 'SHA-256:'
@@ -79,4 +105,4 @@ jobs:
             cat out/SHA256SUMS
             echo '```'
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" out/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md
