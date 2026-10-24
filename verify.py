@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Checks dist/ is an LGPL build before it's published: mpv built with -Dgpl=false, FFmpeg reporting an LGPL licence,
-and no GPL-only code (x264, x265, FFmpeg's GPL configuration) in any DLL. Exits non-zero on the first problem."""
+"""Checks dist/ (or dist-single/) is an LGPL build before it's published: mpv built with -Dgpl=false, FFmpeg reporting
+an LGPL licence, and no GPL-only code (x264, x265, FFmpeg's GPL configuration) in any DLL. FFmpeg is checked in its own
+DLLs or, in the single-DLL variant, in libmpv-2.dll. Exits non-zero on the first problem."""
 
 import pathlib
 import re
@@ -27,10 +28,14 @@ else:
     if b"-Dgpl=false" not in data:
         problems.append("libmpv-2.dll's configuration doesn't say -Dgpl=false")
 
-avcodec = [d for d in dlls if d.name.startswith("avcodec-")]
-if not avcodec:
-    problems.append("no avcodec DLL")
-for dll in [d for d in dlls if re.match(r"(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample)-\d+\.dll", d.name)]:
+ffmpeg = [d for d in dlls if re.match(r"(avcodec|avformat|avutil|avfilter|avdevice|swscale|swresample)-\d+\.dll", d.name)]
+if ffmpeg:
+    if not any(d.name.startswith("avcodec-") for d in ffmpeg):
+        problems.append("no avcodec DLL")
+elif libmpv.exists():
+    # The single-DLL variant: FFmpeg is linked into libmpv-2.dll.
+    ffmpeg = [libmpv]
+for dll in ffmpeg:
     data = contents(dll)
     # av*_license() returns this for an LGPL build, and "GPL version 2 or later" for a GPL one.
     if b"LGPL version 2.1 or later" not in data:
