@@ -29,11 +29,12 @@ jobs:
       - uses: actions/checkout@v4
 
       # Only what the build and the 64-bit smoke test use. make, git, curl, xz, zip and pipx are on the runner already.
+      # The runner's Ubuntu mirror sometimes serves these 250 MB at a few hundred KB/s, so this allows 30 minutes.
       - name: Install tools
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
+          sudo apt-get install -o Acquire::Retries=3 --no-install-recommends -y \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm ninja-build pkgconf wine64
           pipx install meson==1.7.0
 
